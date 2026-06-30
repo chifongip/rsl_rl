@@ -7,7 +7,9 @@
 
 from .log_writer import LogWriter
 from .neptune_log_writer import NeptuneLogWriter
+from .motion_loader import AMPLoader
 from .utils import (
+    Normalizer,
     check_nan,
     compile_model,
     get_param,
@@ -21,8 +23,10 @@ from .utils import (
 from .wandb_log_writer import WandbLogWriter
 
 __all__ = [
+    "AMPLoader",
     "LogWriter",
     "NeptuneLogWriter",
+    "Normalizer",
     "WandbLogWriter",
     "check_nan",
     "compile_model",
