@@ -26,12 +26,11 @@ actor/critic, RolloutStorage.Batch iteration).
 
 from __future__ import annotations
 
-from itertools import chain
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
+from collections.abc import Iterable
+from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.algorithms.ppo import PPO
@@ -40,7 +39,13 @@ from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
 from rsl_rl.modules import Discriminator
 from rsl_rl.storage import ReplayBuffer, RolloutStorage
-from rsl_rl.utils import AMPLoader, Normalizer, resolve_callable, resolve_obs_groups
+from rsl_rl.utils import (
+    AMPLoader,
+    Normalizer,
+    resolve_callable,
+    resolve_obs_groups,
+    resolve_optimizer,
+)
 
 
 class AMPPPO(PPO):
@@ -126,32 +131,46 @@ class AMPPPO(PPO):
             multi_gpu_cfg=multi_gpu_cfg,
         )
 
-        # Rebuild optimizer to include discriminator params with weight decay.
-        self.optimizer = optim.Adam(
-            [
-                {"params": self._raw_actor.parameters(), "name": "actor"},
-                {"params": self._raw_critic.parameters(), "name": "critic"},
-                {
-                    "params": self.discriminator.trunk.parameters(),
-                    "weight_decay": 10e-4,
-                    "name": "amp_trunk",
-                },
-                {
-                    "params": self.discriminator.amp_linear.parameters(),
-                    "weight_decay": 10e-2,
-                    "name": "amp_head",
-                },
-            ],
-            lr=learning_rate,
-        )
+        # Rebuild the optimizer to include discriminator parameters. Parameters
+        # are deduplicated because actor and critic may share CNN encoders.
+        seen_parameters: set[int] = set()
 
-        # Cache the actor's std parameter for min_std clamping.
+        def unique_parameters(parameters: Iterable[nn.Parameter]) -> list[nn.Parameter]:
+            unique: list[nn.Parameter] = []
+            for parameter in parameters:
+                if id(parameter) not in seen_parameters:
+                    seen_parameters.add(id(parameter))
+                    unique.append(parameter)
+            return unique
+
+        parameter_groups = [
+            {"params": unique_parameters(self._raw_actor.parameters()), "name": "actor"},
+            {"params": unique_parameters(self._raw_critic.parameters()), "name": "critic"},
+            {
+                "params": unique_parameters(self.discriminator.trunk.parameters()),
+                "weight_decay": 10e-4,
+                "name": "amp_trunk",
+            },
+            {
+                "params": unique_parameters(self.discriminator.amp_linear.parameters()),
+                "weight_decay": 10e-2,
+                "name": "amp_head",
+            },
+        ]
+        self.optimizer = resolve_optimizer(optimizer)(parameter_groups, lr=learning_rate)
+
+        # Cache the actor's state-independent std parameter for min_std
+        # clamping, preserving its scalar/log parameterization.
         self._actor_std_param: torch.Tensor | None = None
+        self._actor_std_is_log = False
         if self.min_std is not None:
-            for name, param in self._raw_actor.named_parameters():
-                if name == "std" or name.endswith(".std") or name.endswith("std_param"):
-                    self._actor_std_param = param
-                    break
+            distribution = getattr(self._raw_actor, "distribution", None)
+            if distribution is not None:
+                if hasattr(distribution, "std_param"):
+                    self._actor_std_param = distribution.std_param
+                elif hasattr(distribution, "log_std_param"):
+                    self._actor_std_param = distribution.log_std_param
+                    self._actor_std_is_log = True
 
     # ------------------------------------------------------------------
     # Factory (replaces PPO.construct_algorithm for AMP tasks)
@@ -292,11 +311,10 @@ class AMPPPO(PPO):
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and record AMP observations for this step."""
-        if self.actor.is_recurrent:
-            self.transition.hidden_states = (
-                self.actor.get_hidden_state(),
-                self.critic.get_hidden_state(),
-            )
+        self.transition.hidden_states = (
+            self.actor.get_hidden_state(),
+            self.critic.get_hidden_state(),
+        )
 
         self.transition.actions = self.actor(obs, stochastic_output=True).detach()
         self.transition.values = self.critic(obs).detach()
@@ -393,7 +411,7 @@ class AMPPPO(PPO):
         skipped_non_finite_batches = 0
 
         # Mini-batch generators
-        if self.actor.is_recurrent:
+        if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(
                 self.num_mini_batches, self.num_learning_epochs
             )
@@ -589,17 +607,7 @@ class AMPPPO(PPO):
                 self.rnd.optimizer.step()
 
             # Clamp min std
-            if self._actor_std_param is not None:
-                with torch.no_grad():
-                    if self.min_std.numel() == 1:
-                        clamped_min = self.min_std.expand_as(self._actor_std_param)
-                    elif self.min_std.numel() != self._actor_std_param.numel():
-                        clamped_min = torch.clamp_min(
-                            self.min_std.min(), 1e-6
-                        ).expand_as(self._actor_std_param)
-                    else:
-                        clamped_min = self.min_std
-                    self._actor_std_param.clamp_(min=clamped_min)
+            self._clamp_actor_std()
 
             # Update AMP normalizer with raw (pre-normalization) data
             if self.amp_normalizer is not None:
@@ -639,6 +647,22 @@ class AMPPPO(PPO):
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss / n
         return loss_dict
+
+    def _clamp_actor_std(self) -> None:
+        """Clamp a state-independent actor standard deviation to ``min_std``."""
+        if self._actor_std_param is None or self.min_std is None:
+            return
+        with torch.no_grad():
+            if self.min_std.numel() == 1:
+                clamped_min = self.min_std.expand_as(self._actor_std_param)
+            elif self.min_std.numel() != self._actor_std_param.numel():
+                clamped_min = self.min_std.min().expand_as(self._actor_std_param)
+            else:
+                clamped_min = self.min_std
+            clamped_min = clamped_min.clamp_min(1e-6)
+            if self._actor_std_is_log:
+                clamped_min = torch.log(clamped_min)
+            self._actor_std_param.clamp_(min=clamped_min)
 
     # ------------------------------------------------------------------
     # Save / Load (v6 format)

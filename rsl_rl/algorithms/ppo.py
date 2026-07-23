@@ -89,9 +89,11 @@ class PPO:
         self._raw_critic = self.critic
 
         # Create the optimizer
-        self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
-        )  # type: ignore
+        # Deduplicate parameters because actor and critic may share encoders.
+        optimizer_parameters = {
+            id(parameter): parameter for parameter in chain(self.actor.parameters(), self.critic.parameters())
+        }
+        self.optimizer = resolve_optimizer(optimizer)(optimizer_parameters.values(), lr=learning_rate)  # type: ignore
 
         # Add storage
         self.storage = storage

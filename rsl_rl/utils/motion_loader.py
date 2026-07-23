@@ -201,6 +201,10 @@ class AMPLoader:
             _body_ang_vel_w = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device)
 
             time_step_total = _dof_pos.shape[0]
+            if time_step_total < 2:
+                raise ValueError(
+                    f"Motion '{motion_name}' must contain at least two frames, got {time_step_total}."
+                )
 
             # allocate storage for this motion
             _body_pos_b = torch.zeros(
@@ -301,9 +305,11 @@ class AMPLoader:
 
             # random frame indices
             idxs = torch.randint(
-                0, current_time_step_total, (mini_batch_size,), device=current_body_pos_b.device
+                0,
+                current_time_step_total - 1,
+                (mini_batch_size,),
+                device=current_body_pos_b.device,
             )
-            idxs = torch.clamp(idxs, max=current_time_step_total - 1)
 
             batch_body_pos_b = current_body_pos_b[idxs]
             batch_body_ori_b = current_body_ori_b[idxs]
@@ -320,7 +326,6 @@ class AMPLoader:
             )
 
             next_idxs = idxs + 1
-            next_idxs = torch.clamp(next_idxs, max=current_time_step_total - 1)
             batch_next_body_pos_b = current_body_pos_b[next_idxs]
             batch_next_body_ori_b = current_body_ori_b[next_idxs]
             batch_next_body_lin_vel_b = current_body_lin_vel_b[next_idxs]

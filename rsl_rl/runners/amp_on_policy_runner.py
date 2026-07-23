@@ -224,11 +224,18 @@ class AMPOnPolicyRunner:
 
     def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None):
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
-        self.alg.load(loaded_dict)
-        if "iter" in loaded_dict:
+        load_iteration = self.alg.load(
+            loaded_dict,
+            load_cfg={
+                "actor": True,
+                "critic": True,
+                "optimizer": load_optimizer,
+                "iteration": True,
+                "rnd": True,
+            },
+        )
+        if load_iteration and "iter" in loaded_dict:
             self.current_learning_iteration = loaded_dict["iter"]
-        if load_optimizer and "optimizer_state_dict" in loaded_dict:
-            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         # Restore obs normalizer state if saved separately
         if "actor_obs_norm_state_dict" in loaded_dict:
             self.alg._raw_actor.obs_normalizer.load_state_dict(

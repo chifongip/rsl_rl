@@ -196,8 +196,15 @@ def test_smoke():
     print(f"[4/6] Update OK — losses: {loss_dict}")
 
     # Verify loss dict keys
-    expected_keys = {"value_function", "surrogate", "entropy", "amp", "amp_grad_pen",
-                     "amp_policy_pred", "amp_expert_pred"}
+    expected_keys = {
+        "value",
+        "surrogate",
+        "entropy",
+        "amp",
+        "amp_grad_pen",
+        "amp_policy_pred",
+        "amp_expert_pred",
+    }
     assert expected_keys.issubset(loss_dict.keys()), f"Missing loss keys: {expected_keys - loss_dict.keys()}"
 
     # Check no NaN/Inf
