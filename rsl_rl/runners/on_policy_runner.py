@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import time
 import torch
+from tensordict import TensorDict
 
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
@@ -91,11 +92,11 @@ class OnPolicyRunner:
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # Process the step
-                    self.alg.process_env_step(obs, rewards, dones, extras)
+                    rewards_for_logging = self._process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards if RND is used (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"]["rnd_cfg"] else None
                     # Book keeping
-                    self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
+                    self.logger.process_env_step(rewards_for_logging, dones, extras, intrinsic_rewards)
 
                 stop = time.time()
                 collect_time = stop - start
@@ -132,6 +133,13 @@ class OnPolicyRunner:
         if self.logger.writer is not None:
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
             self.logger.stop_logging_writer()
+
+    def _process_env_step(
+        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict
+    ) -> torch.Tensor:
+        """Process an environment step and return rewards used for logging."""
+        self.alg.process_env_step(obs, rewards, dones, extras)
+        return rewards
 
     def save(self, path: str, infos: dict | None = None) -> None:
         """Save the models and training state to a given path and upload them if external logging is used."""

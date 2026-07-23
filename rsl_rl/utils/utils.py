@@ -396,20 +396,23 @@ class RunningMeanStd:
     https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
     """
 
-    def __init__(self, epsilon: float = 1e-4, shape: tuple[int, ...] = ()):
+    def __init__(self, epsilon: float = 1e-4, shape: tuple[int, ...] = ()) -> None:
+        """Initialize running statistics."""
         self.mean = torch.zeros(shape, dtype=torch.float32)
         self.var = torch.ones(shape, dtype=torch.float32)
         self.count = epsilon
 
     def update(self, arr: torch.Tensor) -> None:
+        """Update statistics from a batch."""
         batch_mean = arr.float().mean(dim=0)
         batch_var = arr.float().var(dim=0, unbiased=False)
         batch_count = arr.shape[0]
         self.update_from_moments(batch_mean, batch_var, batch_count)
 
-    def update_from_moments(
-        self, batch_mean: torch.Tensor, batch_var: torch.Tensor, batch_count: int
-    ) -> None:
+    def update_from_moments(self, batch_mean: torch.Tensor, batch_var: torch.Tensor, batch_count: int) -> None:
+        """Merge precomputed batch moments into the running statistics."""
+        if batch_count <= 0:
+            return
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
 
@@ -427,7 +430,8 @@ class RunningMeanStd:
 class Normalizer(RunningMeanStd):
     """Running normalizer that clips observations to a fixed range."""
 
-    def __init__(self, input_dim: int, epsilon: float = 1e-4, clip_obs: float = 10.0):
+    def __init__(self, input_dim: int, epsilon: float = 1e-4, clip_obs: float = 10.0) -> None:
+        """Initialize observation normalization statistics."""
         super().__init__(shape=input_dim)
         self.epsilon = epsilon
         self.clip_obs = clip_obs
@@ -436,6 +440,7 @@ class Normalizer(RunningMeanStd):
         self._cached_std: torch.Tensor | None = None
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize a tensor on the statistics' CPU device."""
         return torch.clamp(
             (x - self.mean) / torch.sqrt(self.var + self.epsilon),
             -self.clip_obs,
@@ -443,6 +448,7 @@ class Normalizer(RunningMeanStd):
         )
 
     def normalize_torch(self, x: torch.Tensor, device: str | torch.device) -> torch.Tensor:
+        """Normalize using cached statistics on the requested device."""
         if device != self._cached_device or self._cached_mean is None:
             self._cached_device = device
             self._cached_mean = self.mean.to(device=device, dtype=torch.float32)
@@ -451,5 +457,25 @@ class Normalizer(RunningMeanStd):
 
     def invalidate_cache(self) -> None:
         """Invalidate cached device tensors so the next normalize_torch picks up updated stats."""
+        self._cached_device = None
         self._cached_mean = None
         self._cached_std = None
+
+    def state_dict(self) -> dict:
+        """Return portable numerical normalizer state."""
+        return {
+            "mean": self.mean.clone(),
+            "var": self.var.clone(),
+            "count": self.count,
+            "epsilon": self.epsilon,
+            "clip_obs": self.clip_obs,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Restore numerical state and discard device-specific caches."""
+        self.mean = state_dict["mean"].detach().cpu().float().clone()
+        self.var = state_dict["var"].detach().cpu().float().clone()
+        self.count = float(state_dict["count"])
+        self.epsilon = float(state_dict.get("epsilon", self.epsilon))
+        self.clip_obs = float(state_dict.get("clip_obs", self.clip_obs))
+        self.invalidate_cache()

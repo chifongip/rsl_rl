@@ -19,11 +19,11 @@
 import torch
 import torch.nn as nn
 from torch import autograd
+from typing import Any
 
 
 class Discriminator(nn.Module):
-    """
-    Discriminator neural network for adversarial motion priors (AMP) reward prediction.
+    """Discriminator neural network for AMP reward prediction.
 
     Args:
         input_dim (int): Dimension of the input feature vector (concatenated state and next state).
@@ -41,13 +41,22 @@ class Discriminator(nn.Module):
 
     def __init__(
         self,
-        input_dim,
-        amp_reward_coef,
-        hidden_layer_sizes,
-        device,
-        task_reward_lerp=0.0,
-    ):
+        input_dim: int,
+        amp_reward_coef: float,
+        hidden_layer_sizes: list[int] | tuple[int, ...],
+        device: str | torch.device,
+        task_reward_lerp: float = 0.0,
+    ) -> None:
+        """Initialize the discriminator network and reward configuration."""
         super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {input_dim}.")
+        if not hidden_layer_sizes or any(size <= 0 for size in hidden_layer_sizes):
+            raise ValueError("hidden_layer_sizes must contain positive dimensions.")
+        if amp_reward_coef < 0:
+            raise ValueError("amp_reward_coef must be nonnegative.")
+        if not 0.0 <= task_reward_lerp <= 1.0:
+            raise ValueError("task_reward_lerp must be in [0, 1].")
 
         self.device = device
         self.input_dim = input_dim
@@ -67,9 +76,8 @@ class Discriminator(nn.Module):
 
         self.task_reward_lerp = task_reward_lerp
 
-    def forward(self, x):
-        """
-        Forward pass through the discriminator network.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run a forward pass through the discriminator network.
 
         Args:
             x (torch.Tensor): Input tensor with shape (batch_size, input_dim).
@@ -81,9 +89,13 @@ class Discriminator(nn.Module):
         d = self.amp_linear(h)
         return d
 
-    def compute_grad_pen(self, expert_state, expert_next_state, lambda_=10):
-        """
-        Compute gradient penalty for the expert data, used to regularize the discriminator.
+    def compute_grad_pen(
+        self,
+        expert_state: torch.Tensor,
+        expert_next_state: torch.Tensor,
+        lambda_: float = 10,
+    ) -> torch.Tensor:
+        """Compute the discriminator gradient penalty on expert data.
 
         Args:
             expert_state (torch.Tensor): Batch of expert states.
@@ -111,9 +123,14 @@ class Discriminator(nn.Module):
         grad_pen = lambda_ * (grad.norm(2, dim=1) - 0).pow(2).mean()
         return grad_pen
 
-    def predict_amp_reward(self, state, next_state, task_reward, normalizer=None):
-        """
-        Predict the AMP reward given current and next states, optionally interpolated with a task reward.
+    def predict_amp_reward(
+        self,
+        state: torch.Tensor,
+        next_state: torch.Tensor,
+        task_reward: torch.Tensor,
+        normalizer: Any | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict AMP reward, optionally interpolated with task reward.
 
         Args:
             state (torch.Tensor): Current state tensor.
@@ -126,20 +143,20 @@ class Discriminator(nn.Module):
                 - reward (torch.Tensor): Predicted AMP reward (optionally interpolated) with shape (batch_size,).
                 - d (torch.Tensor): Raw discriminator output logits with shape (batch_size, 1).
         """
-        with torch.no_grad():
-            self.eval()
-            if normalizer is not None:
-                state = normalizer.normalize_torch(state, self.device)
-                next_state = normalizer.normalize_torch(next_state, self.device)
+        was_training = self.training
+        self.eval()
+        try:
+            with torch.no_grad():
+                if normalizer is not None:
+                    state = normalizer.normalize_torch(state, self.device)
+                    next_state = normalizer.normalize_torch(next_state, self.device)
 
-            d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1)))
-            reward = self.amp_reward_coef * torch.clamp(
-                1 - (1 / 4) * torch.square(d - 1), min=0
-            )
-            if self.task_reward_lerp > 0:
-                task_r = task_reward.unsqueeze(-1)
-                reward = (1.0 - self.task_reward_lerp) * reward + self.task_reward_lerp * task_r
-            self.train()
-
-            reward = reward.squeeze(-1)
+                d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1)))
+                reward = self.amp_reward_coef * torch.clamp(1 - (1 / 4) * torch.square(d - 1), min=0)
+                if self.task_reward_lerp > 0:
+                    task_r = task_reward.unsqueeze(-1)
+                    reward = (1.0 - self.task_reward_lerp) * reward + self.task_reward_lerp * task_r
+                reward = reward.squeeze(-1)
+        finally:
+            self.train(was_training)
         return reward, d
